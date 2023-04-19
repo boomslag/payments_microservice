@@ -230,16 +230,16 @@ def calculate_product_price(object):
     discount = response_data['results']['details']['discount']
 
     if price is not None:
-        base_price = price
-    else:
-        if selected_weight:
-            base_price += Decimal(selected_weight.get('price'))
-        if selected_material:
-            base_price += Decimal(selected_material.get('price'))
-        if selected_color:
-            base_price += Decimal(selected_color.get('price'))
-        if selected_size:
-            base_price += Decimal(selected_size.get('price'))
+        base_price = Decimal(price)
+
+    if selected_weight:
+        base_price += Decimal(selected_weight.get('price'))
+    if selected_material:
+        base_price += Decimal(selected_material.get('price'))
+    if selected_color:
+        base_price += Decimal(selected_color.get('price'))
+    if selected_size:
+        base_price += Decimal(selected_size.get('price'))
 
     # Calculate Total Cost Without Discounts and Coupons and Taxes (total_cost)
     if discount == False:
@@ -309,16 +309,15 @@ class CryptoPaymentView(StandardAPIView):
     def post(self, request, format=None):
         payload = validate_token(request)
         user_id = payload['user_id']
-        buyer_address = payload['address']
-        guy = payload['polygon_address']
         data= request.data
         userID = data['userID']
+        buyer_address = data['address']
+        guy = data['polygonAddress']
 
         # Create an empty list to hold transaction hashes
         tx_hashes = []
         courses = []
         products = []
-        
         
         finalPrice = 0.0
 
@@ -332,10 +331,10 @@ class CryptoPaymentView(StandardAPIView):
             cache.set('eth_price', eth_price, 1 * 60) # cache for 1 minutes
             cache.set('matic_price', matic_price, 1 * 60) # cache for 1 minutes
 
-
         if user_id == userID:
             # Get user cart items
             cart_items = data.get('cartItems')
+            print('Cart Items to Buy: ', cart_items)
 
             for item in cart_items:
                 if item.get('course'):
@@ -345,6 +344,7 @@ class CryptoPaymentView(StandardAPIView):
             
             # PROCESS COURSE PAYMENT
             for object in courses:
+                print('Purchasing Course object: ', object)
                 finalCoursePrice = Decimal('0')
                 # Calculate Price to Pay Per Course
                 final_course_price, course_response, is_discounted = calculate_course_price(object)
@@ -357,7 +357,6 @@ class CryptoPaymentView(StandardAPIView):
                 tokenId = int(token_id)
                 nft_id = random.randint(10000, 999999999)
                 qty = 1
-
 
                 # Pay for course
                 seller_id = course_response.get('results').get('details').get('sellers')[0].get('author')
@@ -381,7 +380,7 @@ class CryptoPaymentView(StandardAPIView):
                 ticket_contract = polygon_web3.eth.contract(abi=abi, address=contract_address)
 
                 # Check if user has sufficient balance
-                balance = polygon_web3.eth.get_balance(payload['polygon_address'])
+                balance = polygon_web3.eth.get_balance(guy)
                 if balance < polygon_web3.eth.gas_price + price_in_wei:
                     return self.send_error('insufficient funds for gas * price + value', status=status.HTTP_400_BAD_REQUEST)
                 
@@ -479,7 +478,7 @@ class CryptoPaymentView(StandardAPIView):
                     # Check if the user has the BUYER_ROLE
                     hasAffiliateRole = affiliate_contract_instance.functions.hasRole(affiliate_role, guy).call()
                     if not hasAffiliateRole:
-                        print(f"Granting affiliate role to {payload['polygon_address']}")
+                        print(f"Granting affiliate role to {guy}")
                         grant_role_txn = affiliate_contract_instance.functions.grantRole(affiliate_role, guy).buildTransaction(
                             {
                                 "from": owner_wallet,
@@ -492,7 +491,7 @@ class CryptoPaymentView(StandardAPIView):
                         grant_role_txReceipt = polygon_web3.eth.wait_for_transaction_receipt(grant_role_txHash)
 
                         if grant_role_txReceipt['status'] == 1:
-                            print(f"Successfully Granted Affiliate Role to {payload['polygon_address']}.")
+                            print(f"Successfully Granted Affiliate Role to {guy}.")
                         else:
                             print("Failed to grant affiliate role.")
                             return self.send_error('Failed to register the NFT in the Booth contract', status=status.HTTP_400_BAD_REQUEST)
@@ -513,6 +512,7 @@ class CryptoPaymentView(StandardAPIView):
 
                 # Add TX HASH to List of Transactions for User to Verify
                 # Kafka Producer including Ticket_Address = NFT ddress
+                print('Adding NFT to NFT List, kafka producer')
                 item={}
                 item['nft_id']=nft_id
                 item['ticket_id']=token_id
@@ -524,6 +524,81 @@ class CryptoPaymentView(StandardAPIView):
                     'nft_minted',
                     key='create_and_add_nft_to_nftList',
                     value=json.dumps(item).encode('utf-8')
+                )
+                producer.flush()
+
+                # Create Notification Object through kafka producer
+                print('Creating Notification, kafka producer')
+                notification_data = {
+                    'from_user': user_id,
+                    'to_user': seller_id,
+                    'notification_type': 4,
+                    'text_preview': """Congratulations! Your course has just been sold! 🎉🎊!""",
+                    'url': '/courses/'+course_uuid,
+                    'is_seen': False,
+                    'icon': 'bx bxs-graduation',
+                    'course': course_uuid,
+                }
+                producer.produce(
+                    'notifications',
+                    key='course_sold',
+                    value=json.dumps(notification_data).encode('utf-8')
+                )
+                # encode notification data as JSON and produce to Kafka topic
+                producer.flush()
+
+                # ADD Course to user library
+                print('Adding Course to Library, kafka producer')
+                course_data = {
+                    'user_id': user_id,
+                    'course': course_uuid,
+                    'tokenID': tokenId,
+                    'contractAddress': contract_address,
+                }
+                producer.produce(
+                    'nft_minted',
+                    key='course_bought',
+                    value=json.dumps(course_data).encode('utf-8')
+                )
+                producer.flush()
+
+                #  ADD instructor to user conntact list
+                print('Adding Instructor to Buyer Contacts, kafka producer')
+                contact_data = {
+                    'buyer_id': user_id,
+                    'seller_id': seller_id,
+                }
+                producer.produce(
+                    'user_contacts',
+                    key='add_instructor_contact',
+                    value=json.dumps(contact_data).encode('utf-8')
+                )
+                producer.flush()
+
+                # Create Order
+                print('Creating Order, sending message with kafka Producer')
+                order_data = {
+                    'cartItems': cart_items,
+                    'userID': user_id,
+                    'course_response': course_response
+                }
+                producer.produce(
+                    'orders',
+                    key='create_order',
+                    value=json.dumps(order_data).encode('utf-8')
+                )
+                producer.flush()
+
+                # Delete course from cart
+                print('Deleting Course from Cart, kafka producer')
+                delete_cart_item_data = {
+                    'user_id': user_id,
+                    'course_id': course_uuid,
+                }
+                producer.produce(
+                    'cart',
+                    key='course_bought',
+                    value=json.dumps(delete_cart_item_data).encode('utf-8')
                 )
                 producer.flush()
 
@@ -575,56 +650,12 @@ class CryptoPaymentView(StandardAPIView):
                     print("Funds released to seller successfully!")
                 else:
                     print("Error releasing funds to seller")
-
-                # Create Notification Object through kafka producer
-                notification_data = {
-                    'from_user': user_id,
-                    'to_user': seller_id,
-                    'notification_type': 4,
-                    'text_preview': """Congratulations! Your course has just been sold! 🎉🎊!""",
-                    'url': '/courses/'+course_uuid,
-                    'is_seen': False,
-                    'icon': 'bx bxs-graduation',
-                    'course': course_uuid,
-                }
-                producer.produce(
-                    'notifications',
-                    key='course_sold',
-                    value=json.dumps(notification_data).encode('utf-8')
-                )
-                # encode notification data as JSON and produce to Kafka topic
-                producer.flush()
-
-                # ADD Course to user library
-                course_data = {
-                    'user_id': user_id,
-                    'course': course_uuid,
-                    'tokenID': tokenId,
-                    'contractAddress': contract_address,
-                }
-                producer.produce(
-                    'nft_minted',
-                    key='course_bought',
-                    value=json.dumps(course_data).encode('utf-8')
-                )
-                producer.flush()
-
-                #  ADD instructor to user conntact list
-                contact_data = {
-                    'buyer_id': user_id,
-                    'seller_id': seller_id,
-                }
-                producer.produce(
-                    'user_contacts',
-                    key='add_instructor_contact',
-                    value=json.dumps(contact_data).encode('utf-8')
-                )
-                producer.flush()
                 
             # PROCESS PRODUCT PAYMENT
             for object in products:
                 finalProductPrice = Decimal('0')
                 final_product_price, product_response, is_discounted = calculate_product_price(object)
+                
 
                 finalProductPrice += Decimal(final_product_price)
                 product_matic_price = Decimal(final_product_price) / Decimal(matic_price)
@@ -647,6 +678,15 @@ class CryptoPaymentView(StandardAPIView):
                 # Decrypt private key for buyer
                 buyer_private_key = decrypt_polygon_private_key(buyer_address)
 
+                print(f"""
+                Private Key: {buyer_private_key}
+                Token ID: {tokenId}
+                NFT ID: {nft_id}
+                Quantity: {qty}
+                Price in WEI: {price_in_wei}
+                Product Price: {final_product_price}
+                """)
+
                 # Build Instance of Contract
                 contract_address = product_response.get('results').get('details').get('nft_address')
                 # Fetch ABI
@@ -655,7 +695,7 @@ class CryptoPaymentView(StandardAPIView):
                 ticket_contract = polygon_web3.eth.contract(abi=abi, address=contract_address)
 
                 # Check if user has sufficient balance
-                balance = polygon_web3.eth.get_balance(payload['polygon_address'])
+                balance = polygon_web3.eth.get_balance(guy)
                 if balance < polygon_web3.eth.gas_price + price_in_wei:
                     return self.send_error('insufficient funds for gas * price + value', status=status.HTTP_400_BAD_REQUEST)
                 
@@ -753,7 +793,7 @@ class CryptoPaymentView(StandardAPIView):
                     # Check if the user has the BUYER_ROLE
                     hasAffiliateRole = affiliate_contract_instance.functions.hasRole(affiliate_role, guy).call()
                     if not hasAffiliateRole:
-                        print(f"Granting affiliate role to {payload['polygon_address']}")
+                        print(f"Granting affiliate role to {guy}")
                         grant_role_txn = affiliate_contract_instance.functions.grantRole(affiliate_role, guy).buildTransaction(
                             {
                                 "from": owner_wallet,
@@ -766,7 +806,7 @@ class CryptoPaymentView(StandardAPIView):
                         grant_role_txReceipt = polygon_web3.eth.wait_for_transaction_receipt(grant_role_txHash)
 
                         if grant_role_txReceipt['status'] == 1:
-                            print(f"Successfully Granted Affiliate Role to {payload['polygon_address']}.")
+                            print(f"Successfully Granted Affiliate Role to {guy}.")
                         else:
                             print("Failed to grant affiliate role.")
                             return self.send_error('Failed to register the NFT in the Booth contract', status=status.HTTP_400_BAD_REQUEST)
@@ -787,6 +827,7 @@ class CryptoPaymentView(StandardAPIView):
 
                 # Add TX HASH to List of Transactions for User to Verify
                 # Kafka Producer including Ticket_Address = NFT ddress
+                print('Adding NFT to NFT List, sending message with kafka Producer')
                 item={}
                 item['nft_id']=nft_id
                 item['ticket_id']=token_id
@@ -798,6 +839,70 @@ class CryptoPaymentView(StandardAPIView):
                     'nft_minted',
                     key='create_and_add_nft_to_nftList',
                     value=json.dumps(item).encode('utf-8')
+                )
+                producer.flush()
+
+                # Create Notification Object through kafka producer
+                print('Creating Notification, sending message with kafka Producer')
+                notification_data = {
+                    'from_user': user_id,
+                    'to_user': seller_id,
+                    'notification_type': 4,
+                    'text_preview': """Congratulations! Your product has just been sold! 🎉🎊!""",
+                    'url': '/products/' + product_uuid,
+                    'is_seen': False,
+                    'icon': 'bx bxs-graduation',
+                    'product': product_uuid,
+                }
+                producer.produce(
+                    'notifications',
+                    key='course_sold',
+                    value=json.dumps(notification_data).encode('utf-8')
+                )
+                # encode notification data as JSON and produce to Kafka topic
+                producer.flush()
+
+
+                print('Adding seller to buyer contacts, sending message with kafka Producer')
+                contact_data = {
+                    'buyer_id': user_id,
+                    'seller_id': seller_id,
+                }
+
+                producer.produce(
+                    'user_contacts',
+                    key='add_seller_contact',
+                    value=json.dumps(contact_data).encode('utf-8')
+                )
+                producer.flush()
+
+
+                # Create Order
+                print('Creating Order, sending message with kafka Producer')
+                order_data = {
+                    'cartItems': cart_items,
+                    'deliveryAddress': data.get('deliveryAddress'),
+                    'saveDeliveryAddress': data.get('agreed'),
+                    'userID': user_id,
+                    'product_response': product_response
+                }
+                producer.produce(
+                    'orders',
+                    key='create_order',
+                    value=json.dumps(order_data).encode('utf-8')
+                )
+                producer.flush()
+                
+                # Delete product from cart
+                print('Deleting Product from cart, sending message with kafka Producer')
+                delete_cart_item_data = {
+                    'user_id': user_id,
+                    'product_id': product_uuid,
+                }
+                producer.produce(
+                    'cart',
+                    key='product_bought',
+                    value=json.dumps(delete_cart_item_data).encode('utf-8')
                 )
                 producer.flush()
 
@@ -849,52 +954,6 @@ class CryptoPaymentView(StandardAPIView):
                     print("Funds released to seller successfully!")
                 else:
                     print("Error releasing funds to seller")
-
-                # Create Notification Object through kafka producer
-                notification_data = {
-                    'from_user': user_id,
-                    'to_user': seller_id,
-                    'notification_type': 4,
-                    'text_preview': """Congratulations! Your product has just been sold! 🎉🎊!""",
-                    'url': '/products/' + product_uuid,
-                    'is_seen': False,
-                    'icon': 'bx bxs-graduation',
-                    'product': product_uuid,
-                }
-                producer.produce(
-                    'notifications',
-                    key='course_sold',
-                    value=json.dumps(notification_data).encode('utf-8')
-                )
-                # encode notification data as JSON and produce to Kafka topic
-                producer.flush()
-
-                contact_data = {
-                    'buyer_id': user_id,
-                    'seller_id': seller_id,
-                }
-
-                producer.produce(
-                    'user_contacts',
-                    key='add_seller_contact',
-                    value=json.dumps(contact_data).encode('utf-8')
-                )
-                producer.flush()
-
-
-                # Create Order
-                order_data = {
-                    'cartItems': cart_items,
-                    'deliveryAddress': data.get('deliveryAddress'),
-                    'saveDeliveryAddress': data.get('agreed'),
-                    'userID': user_id,
-                }
-                producer.produce(
-                    'orders',
-                    key='create_order',
-                    value=json.dumps(order_data).encode('utf-8')
-                )
-                producer.flush()
             
             responseDictionary = {
                 'transaction_hashes':tx_hashes
@@ -908,9 +967,9 @@ class CryptoPaymentView(StandardAPIView):
 class VerifyTicketOwnershipView(StandardAPIView):
     permission_classes = (permissions.AllowAny,)
     def post(self, request, format=None):
-        payload = validate_token(request)
-        polygon_address = payload['polygon_address']
+        # payload = validate_token(request)
         data= request.data
+        polygon_address = data['polygon_address']
         # Build Instance of Contract
         ticket_id = data['ticket_id']
         contract_address = data['nft_address']
