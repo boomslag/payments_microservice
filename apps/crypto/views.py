@@ -122,9 +122,9 @@ def calculate_course_price(course):
         coupon_percentage_coupon = None
         coupon_discount_percentage = None
 
-    course_price = course_response.get('results', {}).get('details', {}).get('price')
-    course_compare_price = course_response.get('results').get('details').get('compare_price')
-    course_discount = course_response.get('results').get('details').get('discount')
+    course_price = course_response.get('results', {}).get('details', {}).get('price', 0)
+    course_compare_price = course_response.get('results', {}).get('details', {}).get('compare_price', 0)
+    course_discount = course_response.get('results', {}).get('details', {}).get('discount', False)
 
     # Calculate Total Cost Without Discounts and Coupons and Taxes (total_cost)
     if course_discount == False:
@@ -1003,17 +1003,14 @@ class BuyCourseNFT(StandardAPIView):
     def post(self, request, format=None):
         payload = validate_token(request)
         user_id = payload['user_id']
-        guy = payload['polygon_address']
-
         data= request.data
+        print(data)
+        guy = data['polygon_address']
+        buyer_address = data['buyer_address']
 
         # Create an empty list to hold transaction hashes
         tx_hashes = []
-        courses = []
-        products = []
-        finalProductPrice = 0.0
-        finalCoursePrice = 0.0
-        finalPrice = 0.0
+        finalCoursePrice = Decimal('0')
 
         # Fetch Matic and ETH price in USD
         eth_price = cache.get('eth_price')
@@ -1027,273 +1024,295 @@ class BuyCourseNFT(StandardAPIView):
 
         # Calculate Price to Pay Per Course
         final_course_price, course_response, is_discounted = calculate_course_price(data)
-
-        finalCoursePrice += final_course_price
-        course_matic_price = float(final_course_price) / matic_price
+        finalCoursePrice += Decimal(final_course_price)
+        course_matic_price = Decimal(final_course_price) / Decimal(matic_price)
         price_in_wei = polygon_web3.toWei(course_matic_price, 'ether')
         course_uuid = course_response.get('results').get('details').get('id')
+
         
         token_id = course_response.get('results').get('details').get('token_id')
         tokenId = int(token_id)
         nft_id = random.randint(10000, 999999999)
         qty = 1
-
+        
         # Pay for course
         seller_id = course_response.get('results').get('details').get('sellers')[0].get('author')
         seller_ethereum_address = course_response.get('results').get('details').get('sellers')[0].get('address')
         seller_polygon_address = course_response.get('results').get('details').get('sellers')[0].get('polygon_address')
+
         seller_private_key = decrypt_polygon_private_key(seller_ethereum_address)
 
         # Decrypt private key for buyer
-        buyer_private_key = decrypt_polygon_private_key(payload['address'])
+        buyer_private_key = decrypt_polygon_private_key(buyer_address)
 
-        balance = polygon_web3.eth.getBalance(polygon_web3.toChecksumAddress(guy))
-        balance_in_matic = polygon_web3.fromWei(balance, 'ether')
+        # Build Instance of Contract
+        contract_address = course_response.get('results').get('details').get('nft_address')
+        # Fetch ABI
+        # abi = get_polygon_contract_abi(contract_address)
+        ticket_location = os.path.join(settings.BASE_DIR, 'contracts', 'marketplace', 'ticket.sol')
+        with open(os.path.join(ticket_location, 'Ticket.json'), "r") as f:
+            contract_json = json.load(f)
+        abi = contract_json['abi']
+        # bytecode = contract_json['bytecode']
+        # Creat Contract Instance
+        ticket_contract = polygon_web3.eth.contract(abi=abi, address=contract_address)
 
-        if balance_in_matic >= balance_in_matic:
-            # Build Instance of Contract
-            contract_address = course_response.get('results').get('details').get('nft_address')
-            # Fetch ABI
-            abi = get_polygon_contract_abi(contract_address)
-            ticket_contract = polygon_web3.eth.contract(abi=abi, address=contract_address)
+        # Check if user has sufficient balance
+        balance = polygon_web3.eth.get_balance(guy)
+        if balance < polygon_web3.eth.gas_price + price_in_wei:
+            return self.send_error('insufficient funds for gas * price + value', status=status.HTTP_400_BAD_REQUEST)
+        
+        # Call the getStock function for the given tokenId
+        stock = ticket_contract.functions.getStock(tokenId).call()
 
-            # Check if user has sufficient balance
-            balance = polygon_web3.eth.get_balance(payload['polygon_address'])
-            if balance < polygon_web3.eth.gas_price + price_in_wei:
-                return self.send_error('insufficient funds for gas * price + value', status=status.HTTP_400_BAD_REQUEST)
-            
-            # Call the getStock function for the given tokenId
-            stock = ticket_contract.functions.getStock(tokenId).call()
+        # Check if the stock is unlimited or greater than zero
+        if stock == -1 or stock > 0:
+            # Continue with the purchase
+            print("Stock is available, continue with the purchase")
+        else:
+            return self.send_error("No stock available, cannot continue with the purchase", status=status.HTTP_400_BAD_REQUEST)                
 
-            # Check if the stock is unlimited or greater than zero
-            if stock == -1 or stock > 0:
-                # Continue with the purchase
-                print("Stock is available, continue with the purchase")
-            else:
-                return self.send_error("No stock available, cannot continue with the purchase", status=status.HTTP_400_BAD_REQUEST)                
+        # Register NFT in BOOTH Marketplace
+        # abi_booth = get_polygon_contract_abi(booth_contract_address)
+        # bytecode_booth = get_polygon_contract_bytecode(booth_contract_address)
+        booth_location = os.path.join(settings.BASE_DIR, 'contracts', 'marketplace', 'booth.sol')
+        with open(os.path.join(booth_location, 'Booth.json'), "r") as f:
+            contract_json = json.load(f)
+        abi_booth = contract_json['abi']
+        # 3) create contract instance
+        booth_contract_instance = polygon_web3.eth.contract(abi=abi_booth, address=booth_contract_address)
+        # Get the BUYER_ROLE from the contract
+        buyer_role = booth_contract_instance.functions.BUYER_ROLE().call()
+        # Check if the user has the BUYER_ROLE
+        hasRole = booth_contract_instance.functions.hasRole(buyer_role, guy).call()
 
+        if not hasRole:
+            print(f'Setting Buyer ROLE for {guy}')
+            # Create Approve Buyer as Discounted method
+            role = booth_contract_instance.functions.BUYER_ROLE().call()
+            grant_role_txn = booth_contract_instance.functions.grantRole(role, guy).buildTransaction(
+                {
+                    "gasPrice": polygon_web3.eth.gas_price,
+                    "chainId": 80001,
+                    "from": owner_wallet,
+                    "nonce": polygon_web3.eth.getTransactionCount(owner_wallet),
+                }
+            )
+            signed_tx = polygon_web3.eth.account.sign_transaction(grant_role_txn, private_key=owner_wallet_key)
+            tx_hash = polygon_web3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            txReceipt = polygon_web3.eth.wait_for_transaction_receipt(tx_hash)
+
+            if txReceipt.get('status') == 0:
+                return self.send_error('Error Setting Buyer Role')
+        
+        isObjectRegistered = booth_contract_instance.functions.isObjectRegistered(int(tokenId)).call()
+
+        if not isObjectRegistered:
             # Register NFT in BOOTH Marketplace
             abi_booth = get_polygon_contract_abi(booth_contract_address)
-
-            # 3) create contract instance
             booth_contract_instance = polygon_web3.eth.contract(abi=abi_booth, address=booth_contract_address)
 
-            # Get the BUYER_ROLE from the contract
-            buyer_role = booth_contract_instance.functions.BUYER_ROLE().call()
-
-            # Check if the user has the BUYER_ROLE
-            hasRole = booth_contract_instance.functions.hasRole(buyer_role, guy).call()
-
-            if not hasRole:
-                print(f'Setting Buyer ROLE for {guy}')
-                # Create Approve Buyer as Discounted method
-                role = booth_contract_instance.functions.BUYER_ROLE().call()
-                grant_role_txn = booth_contract_instance.functions.grantRole(role, guy).buildTransaction(
-                    {
-                        "gasPrice": polygon_web3.eth.gas_price,
-                        "chainId": 80001,
-                        "from": owner_wallet,
-                        "nonce": polygon_web3.eth.getTransactionCount(owner_wallet),
-                    }
-                )
-                signed_tx = polygon_web3.eth.account.sign_transaction(grant_role_txn, private_key=owner_wallet_key)
-                tx_hash = polygon_web3.eth.send_raw_transaction(signed_tx.rawTransaction)
-                txReceipt = polygon_web3.eth.wait_for_transaction_receipt(tx_hash)
-
-                if txReceipt.get('status') == 0:
-                    return self.send_error('Error Setting Buyer Role')
-            
-            isObjectRegistered = booth_contract_instance.functions.isObjectRegistered(int(tokenId)).call()
-
-            if not isObjectRegistered:
-                # Register NFT in BOOTH Marketplace
-                abi_booth = get_polygon_contract_abi(booth_contract_address)
-                booth_contract_instance = polygon_web3.eth.contract(abi=abi_booth, address=booth_contract_address)
-
-                transaction_params = {
-                    'from': owner_wallet,
-                    'nonce': polygon_web3.eth.get_transaction_count(owner_wallet),
-                    'gasPrice': polygon_web3.eth.gas_price,
-                }
-
-                register_object_function = booth_contract_instance.functions.registerObject(int(tokenId), contract_address)
-                gas_estimate = register_object_function.estimateGas(transaction_params)
-                transaction_params['gas'] = gas_estimate
-
-                tx_booth = register_object_function.buildTransaction(transaction_params)
-
-                signed_tx_booth = polygon_web3.eth.account.sign_transaction(tx_booth, private_key=owner_wallet_key)
-                tx_hash_booth = polygon_web3.eth.send_raw_transaction(signed_tx_booth.rawTransaction)
-                txReceipt_booth = polygon_web3.eth.wait_for_transaction_receipt(tx_hash_booth)
-                # Check if the transaction was successful
-                if txReceipt_booth['status'] == 1:
-                    print("Successfully registered the NFT in the Booth contract.")
-                else:
-                    print("Failed to register the NFT in the Booth contract.")
-                    return self.send_error('Failed to register the NFT in the Booth contract', status=status.HTTP_400_BAD_REQUEST)
-                
-            
-            # Get the referrer value
-            referrer = data.get('referrer', None)
-
-            booth_transaction_params = {
-                'from': guy,
-                'nonce': polygon_web3.eth.get_transaction_count(guy),
-                'gasPrice': polygon_web3.eth.gas_price,
-                'value': price_in_wei,
-                'gas': 600000,
-            }
-            
-            if referrer:
-                print('Purchasing NFT with join Affiliate Program and Buy')
-                abi_affiliates = get_polygon_contract_abi(affiliates_contract)
-                affiliate_contract_instance = polygon_web3.eth.contract(abi=abi_affiliates, address=affiliates_contract)
-                # Get the AFFILIATE_ROLE from the contract
-                affiliate_role = affiliate_contract_instance.functions.AFFILIATE_ROLE().call()
-                # Check if the user has the BUYER_ROLE
-                hasAffiliateRole = affiliate_contract_instance.functions.hasRole(affiliate_role, guy).call()
-                if not hasAffiliateRole:
-                    print(f"Granting affiliate role to {payload['polygon_address']}")
-                    grant_role_txn = affiliate_contract_instance.functions.grantRole(affiliate_role, guy).buildTransaction(
-                        {
-                            "from": owner_wallet,
-                            "nonce": polygon_web3.eth.getTransactionCount(owner_wallet),
-                            "gasPrice": polygon_web3.eth.gas_price,
-                        }
-                    )
-                    sign_grant_role_txn = polygon_web3.eth.account.sign_transaction(grant_role_txn, owner_wallet_key)
-                    grant_role_txHash = polygon_web3.eth.send_raw_transaction(sign_grant_role_txn.rawTransaction)
-                    grant_role_txReceipt = polygon_web3.eth.wait_for_transaction_receipt(grant_role_txHash)
-
-                    if grant_role_txReceipt['status'] == 1:
-                        print(f"Successfully Granted Affiliate Role to {payload['polygon_address']}.")
-                    else:
-                        print("Failed to grant affiliate role.")
-                        return self.send_error('Failed to register the NFT in the Booth contract', status=status.HTTP_400_BAD_REQUEST)
-                purchase = booth_contract_instance.functions.joinAffiliateProgramAndBuy(tokenId, nft_id, qty, referrer).buildTransaction(booth_transaction_params)
-            else:
-                print('Purchasing NFT with Buy Method')
-                purchase = booth_contract_instance.functions.buy(tokenId, nft_id, qty, guy).buildTransaction(booth_transaction_params)
-
-            signed_tx_booth = polygon_web3.eth.account.sign_transaction(purchase, private_key=buyer_private_key)
-            tx_hash_booth = polygon_web3.eth.send_raw_transaction(signed_tx_booth.rawTransaction)
-            txReceipt_booth = polygon_web3.eth.wait_for_transaction_receipt(tx_hash_booth)
-            transaction_hash = txReceipt_booth.get('transactionHash').hex()
-            tx_hashes.append(transaction_hash)
-            if(txReceipt_booth['status']==0):
-                print('Payment Failed')
-                return self.send_error('Payment Failed Transaction')
-            print(f'NFT {tokenId} succesfully purchased by {guy}')
-
-            # Add TX HASH to List of Transactions for User to Verify
-            # Kafka Producer including Ticket_Address = NFT ddress
-            item={}
-            item['nft_id']=nft_id
-            item['ticket_id']=token_id
-            item['ticket_address']=contract_address
-            item['wallet_address']=guy
-            item['transaction_hash']=transaction_hash
-
-            producer.produce(
-                'nft_minted',
-                key='create_and_add_nft_to_nftList',
-                value=json.dumps(item).encode('utf-8')
-            )
-            producer.flush()
-
-            # RELEASE FUNDS FOR PLATFORM AND FUNDRAISER
-            # Release funds for platform
-            tx1 = ticket_contract.functions.release(uridium_wallet).buildTransaction({
-                'from': uridium_wallet,
-                'nonce': polygon_web3.eth.get_transaction_count(uridium_wallet),
-                'gasPrice': polygon_web3.eth.gas_price,
-                'gas': 1000000,  # replace with the gas limit for the transaction
-            })
-            signed_tx1 = polygon_web3.eth.account.sign_transaction(tx1, private_key=uridium_wallet_key)
-            tx1_hash = polygon_web3.eth.send_raw_transaction(signed_tx1.rawTransaction)
-            tx1_receipt = polygon_web3.eth.wait_for_transaction_receipt(tx1_hash)
-
-            if tx1_receipt.status == 1:
-                print("Funds released to uridium_wallet successfully!")
-            else:
-                print("Error releasing funds to uridium_wallet")
-                
-            # Release funds for fundraiser
-            tx2 = ticket_contract.functions.release(owner_wallet).buildTransaction({
+            transaction_params = {
                 'from': owner_wallet,
                 'nonce': polygon_web3.eth.get_transaction_count(owner_wallet),
                 'gasPrice': polygon_web3.eth.gas_price,
-                'gas': 1000000,  # replace with the gas limit for the transaction
-            })
+            }
 
-            signed_tx2 = polygon_web3.eth.account.sign_transaction(tx2, private_key=owner_wallet_key)
-            tx2_hash = polygon_web3.eth.send_raw_transaction(signed_tx2.rawTransaction)
-            tx2_receipt = polygon_web3.eth.wait_for_transaction_receipt(tx2_hash)
-            if tx2_receipt.status == 1:
-                print("Funds released to owner_wallet successfully!")
+            register_object_function = booth_contract_instance.functions.registerObject(int(tokenId), contract_address)
+            gas_estimate = register_object_function.estimateGas(transaction_params)
+            transaction_params['gas'] = gas_estimate
+
+            tx_booth = register_object_function.buildTransaction(transaction_params)
+
+            signed_tx_booth = polygon_web3.eth.account.sign_transaction(tx_booth, private_key=owner_wallet_key)
+            tx_hash_booth = polygon_web3.eth.send_raw_transaction(signed_tx_booth.rawTransaction)
+            txReceipt_booth = polygon_web3.eth.wait_for_transaction_receipt(tx_hash_booth)
+            # Check if the transaction was successful
+            if txReceipt_booth['status'] == 1:
+                print("Successfully registered the NFT in the Booth contract.")
             else:
-                print("Error releasing funds to owner_wallet")
+                print("Failed to register the NFT in the Booth contract.")
+                return self.send_error('Failed to register the NFT in the Booth contract', status=status.HTTP_400_BAD_REQUEST)
+                            
+        # PURCAHSE NFT
+        # Get the referrer value
+        referrer = data.get('referrer', None)
+
+        booth_transaction_params = {
+            'from': guy,
+            'nonce': polygon_web3.eth.get_transaction_count(guy),
+            'gasPrice': polygon_web3.eth.gas_price,
+            'value': price_in_wei,
+            'gas': 600000,
+        }
+
+        
+        if referrer:
+            print('Purchasing NFT with join Affiliate Program and Buy')
+            abi_affiliates = get_polygon_contract_abi(affiliates_contract)
+            affiliate_contract_instance = polygon_web3.eth.contract(abi=abi_affiliates, address=affiliates_contract)
+            # Get the AFFILIATE_ROLE from the contract
+            affiliate_role = affiliate_contract_instance.functions.AFFILIATE_ROLE().call()
+            # Check if the user has the BUYER_ROLE
+            hasAffiliateRole = affiliate_contract_instance.functions.hasRole(affiliate_role, guy).call()
+            if not hasAffiliateRole:
+                print(f"Granting affiliate role to {guy}")
+                grant_role_txn = affiliate_contract_instance.functions.grantRole(affiliate_role, guy).buildTransaction(
+                    {
+                        "from": owner_wallet,
+                        "nonce": polygon_web3.eth.getTransactionCount(owner_wallet),
+                        "gasPrice": polygon_web3.eth.gas_price,
+                    }
+                )
+                sign_grant_role_txn = polygon_web3.eth.account.sign_transaction(grant_role_txn, owner_wallet_key)
+                grant_role_txHash = polygon_web3.eth.send_raw_transaction(sign_grant_role_txn.rawTransaction)
+                grant_role_txReceipt = polygon_web3.eth.wait_for_transaction_receipt(grant_role_txHash)
+
+                if grant_role_txReceipt['status'] == 1:
+                    print(f"Successfully Granted Affiliate Role to {guy}.")
+                else:
+                    print("Failed to grant affiliate role.")
+                    return self.send_error('Failed to register the NFT in the Booth contract', status=status.HTTP_400_BAD_REQUEST)
+            purchase = booth_contract_instance.functions.joinAffiliateProgramAndBuy(tokenId, nft_id, qty, referrer).buildTransaction(booth_transaction_params)
+        else:
+            print('Purchasing NFT with Buy Method')
+            purchase = booth_contract_instance.functions.buy(tokenId, nft_id, qty, guy).buildTransaction(booth_transaction_params)
+
+        signed_tx_booth = polygon_web3.eth.account.sign_transaction(purchase, private_key=buyer_private_key)
+        tx_hash_booth = polygon_web3.eth.send_raw_transaction(signed_tx_booth.rawTransaction)
+        txReceipt_booth = polygon_web3.eth.wait_for_transaction_receipt(tx_hash_booth)
+        transaction_hash = txReceipt_booth.get('transactionHash').hex()
+        tx_hashes.append(transaction_hash)
+        if(txReceipt_booth['status']==0):
+            print('Payment Failed')
+            return self.send_error('Payment Failed Transaction')
+        print(f'NFT {tokenId} succesfully purchased by {guy}')
+
+        # Add TX HASH to List of Transactions for User to Verify
+        # Kafka Producer including Ticket_Address = NFT ddress
+        print('Adding NFT to NFT List, kafka producer')
+        item={}
+        item['nft_id']=nft_id
+        item['ticket_id']=token_id
+        item['ticket_address']=contract_address
+        item['wallet_address']=buyer_address
+        item['transaction_hash']=transaction_hash
+
+        producer.produce(
+            'nft_minted',
+            key='create_and_add_nft_to_nftList',
+            value=json.dumps(item).encode('utf-8')
+        )
+        producer.flush()
+
+        # Create Notification Object through kafka producer
+        print('Creating Notification, kafka producer')
+        notification_data = {
+            'from_user': user_id,
+            'to_user': seller_id,
+            'notification_type': 4,
+            'text_preview': """Congratulations! Your course has just been sold! 🎉🎊!""",
+            'url': '/courses/'+course_uuid,
+            'is_seen': False,
+            'icon': 'bx bxs-graduation',
+            'course': course_uuid,
+        }
+        producer.produce(
+            'notifications',
+            key='course_sold',
+            value=json.dumps(notification_data).encode('utf-8')
+        )
+        # encode notification data as JSON and produce to Kafka topic
+        producer.flush()
+
+        # ADD Course to user library
+        print('Adding Course to Library, kafka producer')
+        course_data = {
+            'user_id': user_id,
+            'course': course_uuid,
+            'tokenID': tokenId,
+            'contractAddress': contract_address,
+        }
+        producer.produce(
+            'nft_minted',
+            key='course_bought',
+            value=json.dumps(course_data).encode('utf-8')
+        )
+        producer.flush()
+
+        #  ADD instructor to user conntact list
+        print('Adding Instructor to Buyer Contacts, kafka producer')
+        contact_data = {
+            'buyer_id': user_id,
+            'seller_id': seller_id,
+        }
+        producer.produce(
+            'user_contacts',
+            key='add_instructor_contact',
+            value=json.dumps(contact_data).encode('utf-8')
+        )
+        producer.flush()
+
+        # Delete course from cart
+        print('Deleting Course from Cart, kafka producer')
+        delete_cart_item_data = {
+            'user_id': user_id,
+            'course_id': course_uuid,
+        }
+        producer.produce(
+            'cart',
+            key='course_bought',
+            value=json.dumps(delete_cart_item_data).encode('utf-8')
+        )
+        producer.flush()
+
+        # RELEASE FUNDS FOR PLATFORM AND FUNDRAISER
+        # Release funds for platform
+        tx1 = ticket_contract.functions.release(uridium_wallet).buildTransaction({
+            'from': uridium_wallet,
+            'nonce': polygon_web3.eth.get_transaction_count(uridium_wallet),
+            'gasPrice': polygon_web3.eth.gas_price,
+            'gas': 1000000,  # replace with the gas limit for the transaction
+        })
+        signed_tx1 = polygon_web3.eth.account.sign_transaction(tx1, private_key=uridium_wallet_key)
+        tx1_hash = polygon_web3.eth.send_raw_transaction(signed_tx1.rawTransaction)
+        tx1_receipt = polygon_web3.eth.wait_for_transaction_receipt(tx1_hash)
+
+        if tx1_receipt.status == 1:
+            print("Funds released to uridium_wallet successfully!")
+        else:
+            print("Error releasing funds to uridium_wallet")
             
-            # Release funds for seller
-            tx3 = ticket_contract.functions.release(seller_polygon_address).buildTransaction({
-                'from': seller_polygon_address,
-                'nonce': polygon_web3.eth.get_transaction_count(seller_polygon_address),
-                'gasPrice': polygon_web3.eth.gas_price,
-                'gas': 1000000,  # replace with the gas limit for the transaction
-            })
+        # Release funds for fundraiser
+        tx2 = ticket_contract.functions.release(owner_wallet).buildTransaction({
+            'from': owner_wallet,
+            'nonce': polygon_web3.eth.get_transaction_count(owner_wallet),
+            'gasPrice': polygon_web3.eth.gas_price,
+            'gas': 1000000,  # replace with the gas limit for the transaction
+        })
 
-            signed_tx3 = polygon_web3.eth.account.sign_transaction(tx3, private_key=seller_private_key)
-            tx3_hash = polygon_web3.eth.send_raw_transaction(signed_tx3.rawTransaction)
-            tx3_receipt = polygon_web3.eth.wait_for_transaction_receipt(tx3_hash)
-            if tx3_receipt.status == 1:
-                print("Funds released to seller successfully!")
-            else:
-                print("Error releasing funds to seller")
+        signed_tx2 = polygon_web3.eth.account.sign_transaction(tx2, private_key=owner_wallet_key)
+        tx2_hash = polygon_web3.eth.send_raw_transaction(signed_tx2.rawTransaction)
+        tx2_receipt = polygon_web3.eth.wait_for_transaction_receipt(tx2_hash)
+        if tx2_receipt.status == 1:
+            print("Funds released to owner_wallet successfully!")
+        else:
+            print("Error releasing funds to owner_wallet")
+        
+        # Release funds for seller
+        tx3 = ticket_contract.functions.release(seller_polygon_address).buildTransaction({
+            'from': seller_polygon_address,
+            'nonce': polygon_web3.eth.get_transaction_count(seller_polygon_address),
+            'gasPrice': polygon_web3.eth.gas_price,
+            'gas': 1000000,  # replace with the gas limit for the transaction
+        })
 
-            # Create Notification Object through kafka producer
-            notification_data = {
-                'from_user': user_id,
-                'to_user': seller_id,
-                'notification_type': 4,
-                'text_preview': """Congratulations! Your course has just been sold! 🎉🎊!""",
-                'url': '/courses/'+course_uuid,
-                'is_seen': False,
-                'icon': 'bx bxs-graduation',
-                'course': course_uuid,
-            }
-            producer.produce(
-                'notifications',
-                key='course_sold',
-                value=json.dumps(notification_data).encode('utf-8')
-            )
-            # encode notification data as JSON and produce to Kafka topic
-            producer.flush()
-
-            # ADD Course to user library
-            course_data = {
-                'user_id': user_id,
-                'course': course_uuid,
-                'tokenID': tokenId,
-                'contractAddress': contract_address,
-            }
-            producer.produce(
-                'nft_minted',
-                key='course_bought',
-                value=json.dumps(course_data).encode('utf-8')
-            )
-            producer.flush()
-
-            #  ADD instructor to user conntact list
-            contact_data = {
-                'buyer_id': user_id,
-                'seller_id': seller_id,
-            }
-            producer.produce(
-                'user_contacts',
-                key='add_instructor_contact',
-                value=json.dumps(contact_data).encode('utf-8')
-            )
-            producer.flush()
-            return self.send_response('Payment Success', status=status.HTTP_200_OK)
-        return self.send_error('Insufficient Balance')
+        signed_tx3 = polygon_web3.eth.account.sign_transaction(tx3, private_key=seller_private_key)
+        tx3_hash = polygon_web3.eth.send_raw_transaction(signed_tx3.rawTransaction)
+        tx3_receipt = polygon_web3.eth.wait_for_transaction_receipt(tx3_hash)
+        if tx3_receipt.status == 1:
+            print("Funds released to seller successfully!")
+        else:
+            print("Error releasing funds to seller")
+        return self.send_response('Payment Successfull')
 
